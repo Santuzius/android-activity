@@ -433,6 +433,12 @@ pub struct AndroidAppInner {
 }
 
 impl AndroidAppInner {
+    pub fn set_outlive_activity(&self, outlive: bool) {
+        if outlive {
+            log::warn!("set_outlive_activity is only supported with NativeActivity");
+        }
+    }
+
     pub fn activity_as_ptr(&self) -> *mut c_void {
         // Note: The global reference in `android_app` is only guaranteed to be
         // valid until `onDestroy` returns, so we have our own global reference

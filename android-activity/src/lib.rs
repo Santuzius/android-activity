@@ -849,6 +849,13 @@ impl AndroidApp {
         self.inner.read().unwrap().activity_as_ptr()
     }
 
+    /// Keeps `android_main` running when the activity is destroyed, e.g. when the user swipes the app away from the recent apps while a foreground service keeps the process alive. The next activity of the process then attaches to the running `android_main` instead of starting another one; the app sees the same events as after a return from the background (Start, Resume, a new window), but no `Destroy`.
+    ///
+    /// Off by default, where every activity gets its own `android_main` call. Only supported with NativeActivity; GameActivity logs a warning.
+    pub fn set_outlive_activity(&self, outlive: bool) {
+        self.inner.read().unwrap().set_outlive_activity(outlive)
+    }
+
     /// Polls for any events associated with this [AndroidApp] and processes
     /// those events (such as lifecycle events) via the given `callback`.
     ///

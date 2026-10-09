@@ -6,7 +6,10 @@ use std::{
     ops::Deref,
     panic::catch_unwind,
     ptr::{self, NonNull},
-    sync::{Arc, Condvar, Mutex, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex, Weak,
+    },
 };
 
 use jni::{objects::JObject, refs::Global, vm::AttachConfig};
@@ -19,6 +22,12 @@ use crate::{
 };
 
 use super::{AndroidApp, Rect};
+
+/// Whether `android_main` outlives a destroyed activity, set through `AndroidApp::set_outlive_activity`.
+pub(crate) static OUTLIVE_ACTIVITY: AtomicBool = AtomicBool::new(false);
+
+/// The glue of the last started `android_main`. With [`OUTLIVE_ACTIVITY`] set and that thread still running, a new activity attaches to it instead of starting another `android_main`.
+static RUNNING: Mutex<Option<NativeActivityGlue>> = Mutex::new(None);
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub enum AppCmd {
@@ -111,7 +120,14 @@ impl NativeActivityGlue {
             )),
         };
 
-        let weak_ref = Arc::downgrade(&glue.inner);
+        unsafe { glue.register_callbacks(activity) };
+
+        glue
+    }
+
+    /// Points `activity`'s callbacks and `instance` at this glue.
+    unsafe fn register_callbacks(&self, activity: *mut ndk_sys::ANativeActivity) {
+        let weak_ref = Arc::downgrade(&self.inner);
         let weak_ptr = Weak::into_raw(weak_ref);
         unsafe {
             (*activity).instance = weak_ptr as *mut _;
@@ -134,8 +150,6 @@ impl NativeActivityGlue {
             (*(*activity).callbacks).onInputQueueDestroyed = Some(on_input_queue_destroyed);
             (*(*activity).callbacks).onContentRectChanged = Some(on_content_rect_changed);
         }
-
-        glue
     }
 
     /// Returns the file descriptor that needs to be polled by the Rust main thread
@@ -246,6 +260,11 @@ pub struct NativeActivityState {
 
     pub pending_input_queue: *mut ndk_sys::AInputQueue,
     pub pending_window: Option<NativeWindow>,
+
+    /// Set while the activity is destroyed but `android_main` keeps running (see [`OUTLIVE_ACTIVITY`]).
+    pub detached: bool,
+    /// Global reference to the activity that attached after the first one was destroyed; `None` until then. Replaces the reference `AndroidApp` took at start.
+    pub reattached_activity: Option<Global<JObject<'static>>>,
 }
 
 impl NativeActivityState {
@@ -392,6 +411,8 @@ impl WaitableNativeActivityState {
                 destroyed: false,
                 pending_input_queue: ptr::null_mut(),
                 pending_window: None,
+                detached: false,
+                reattached_activity: None,
             }),
             cond: Condvar::new(),
         }
@@ -417,6 +438,36 @@ impl WaitableNativeActivityState {
             // `ANativeActivity` instance.
             guard.activity = ptr::null_mut();
         }
+    }
+
+    /// `onDestroy` with [`OUTLIVE_ACTIVITY`] set: forget the dying activity, keep `android_main` and the message pipe. Android has already sent Pause, Stop and the destruction of the native window and input queue.
+    pub fn notify_detached(&self) {
+        let mut guard = self.mutex.lock().unwrap();
+        guard.activity = ptr::null_mut();
+        guard.detached = true;
+    }
+
+    /// A new activity takes the place of the destroyed one; it then goes through Start, Resume and window creation as after a return from the background.
+    ///
+    /// # Safety
+    /// `activity` must be the `ANativeActivity` passed to `ANativeActivity_onCreate`.
+    pub unsafe fn reattach(&self, activity: *mut ndk_sys::ANativeActivity, jni_activity: Global<JObject<'static>>) {
+        let mut guard = self.mutex.lock().unwrap();
+        // Android may create the new activity before destroying the old one (e.g. when a launch clears the task). Disconnect the old one: its remaining callbacks then find no glue and are ignored, and its `onDestroy` releases the placeholder.
+        let previous = guard.activity;
+        if !previous.is_null() && previous != activity {
+            unsafe {
+                drop(Weak::from_raw((*previous).instance as *const WaitableNativeActivityState));
+                (*previous).instance = Weak::<WaitableNativeActivityState>::new().into_raw() as *mut _;
+            }
+        }
+        guard.activity = activity;
+        guard.detached = false;
+        guard.reattached_activity = Some(jni_activity);
+        guard.activity_state = State::Init;
+        
+        // The new activity may have another configuration (orientation, night mode, locale); refresh it from its asset manager.
+        guard.write_cmd(AppCmd::ConfigChanged);
     }
 
     pub fn notify_config_changed(&self) {
@@ -690,7 +741,12 @@ unsafe extern "C" fn on_destroy(activity: *mut ndk_sys::ANativeActivity) {
     abort_on_panic(|| {
         log::debug!("Destroy: {:p}\n", activity);
         try_with_waitable_activity_ref(activity, |waitable_activity| {
-            waitable_activity.notify_destroyed()
+            let running = waitable_activity.mutex.lock().unwrap().thread_state == NativeThreadState::Running;
+            if OUTLIVE_ACTIVITY.load(Ordering::Acquire) && running {
+                waitable_activity.notify_detached();
+            } else {
+                waitable_activity.notify_destroyed()
+            }
         });
 
         // Once we return from here the `ANativeActivity` will be deleted via an
@@ -887,6 +943,27 @@ extern "C" fn ANativeActivity_onCreate(
             let jni_activity: jni::sys::jobject = (*activity).clazz as _; // Completely bogus name; this is the _instance_ not class pointer
             (jni::JavaVM::from_raw(jvm), jni_activity)
         };
+
+        // An `android_main` that outlived its activity takes this one over. Skips the per-activity setup below, which would also redirect stdout/stderr again.
+        let running = RUNNING.lock().unwrap().clone();
+        if let Some(glue) = running.filter(|_| OUTLIVE_ACTIVITY.load(Ordering::Acquire)) {
+            if glue.mutex.lock().unwrap().thread_state == NativeThreadState::Running {
+                log::info!("Attaching activity {:p} to the running android_main", activity);
+                let global = jvm
+                    .attach_current_thread(|env| -> jni::errors::Result<_> {
+                        let cast = unsafe { env.as_cast_raw::<Global<JObject>>(&jni_activity)? };
+                        let object: &JObject = &cast;
+                        env.new_global_ref(object)
+                    })
+                    .expect("Failed to create global ref for Activity instance");
+                unsafe {
+                    glue.reattach(activity, global);
+                    glue.register_callbacks(activity);
+                }
+                return;
+            }
+        }
+
         unsafe {
             let saved_state = if !saved_state.is_null() && saved_state_size > 0 {
                 std::slice::from_raw_parts(saved_state.cast(), saved_state_size)
@@ -901,6 +978,7 @@ extern "C" fn ANativeActivity_onCreate(
         let jvm_glue = NativeActivityGlue::new(activity, saved_state, saved_state_size);
 
         let rust_glue = jvm_glue.clone();
+        *RUNNING.lock().unwrap() = Some(jvm_glue.clone());
         // Let us Send the NativeActivity pointer to the Rust main() thread without a wrapper type
         let activity_ptr: libc::intptr_t = activity as _;
 

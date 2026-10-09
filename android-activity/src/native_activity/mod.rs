@@ -169,7 +169,15 @@ impl AndroidAppInner {
         // Note: The global reference in `ANativeActivity::clazz` (misnomer for instance reference)
         // is only guaranteed to be valid until `onDestroy` returns, so we have our own global
         // reference that we can instead guarantee will remain valid until `AndroidApp` is dropped.
-        self.activity.as_raw() as *mut c_void
+        let guard = self.native_activity.mutex.lock().unwrap();
+        match &guard.reattached_activity {
+            Some(activity) => activity.as_raw() as *mut c_void,
+            None => self.activity.as_raw() as *mut c_void,
+        }
+    }
+
+    pub(crate) fn set_outlive_activity(&self, outlive: bool) {
+        glue::OUTLIVE_ACTIVITY.store(outlive, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn looper_as_ptr(&self) -> *mut ndk_sys::ALooper {
@@ -375,7 +383,7 @@ impl AndroidAppInner {
         let res = self
             .jvm
             .attach_current_thread(|env| -> jni::errors::Result<()> {
-                let activity = env.as_cast::<Activity>(self.activity.as_ref())?;
+                let activity = env.as_cast::<Activity>(guard.reattached_activity.as_ref().unwrap_or(&self.activity).as_ref())?;
 
                 let ims = Context::INPUT_METHOD_SERVICE(env)?;
                 let im_manager = activity.as_context().get_system_service(env, ims)?;
@@ -409,7 +417,7 @@ impl AndroidAppInner {
         let res = self
             .jvm
             .attach_current_thread(|env| -> jni::errors::Result<()> {
-                let activity = env.as_cast::<Activity>(self.activity.as_ref())?;
+                let activity = env.as_cast::<Activity>(guard.reattached_activity.as_ref().unwrap_or(&self.activity).as_ref())?;
 
                 let ims = Context::INPUT_METHOD_SERVICE(env)?;
                 let imm_obj = activity.as_context().get_system_service(env, ims)?;
