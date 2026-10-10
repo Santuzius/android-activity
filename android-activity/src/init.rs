@@ -17,8 +17,14 @@ use crate::{
     main_callbacks::MainCallbacks, util::android_log, OnCreateState, ANDROID_ACTIVITY_TAG,
 };
 
-fn forward_stdio_to_logcat() -> std::thread::JoinHandle<std::io::Result<()>> {
+fn forward_stdio_to_logcat() -> Option<std::thread::JoinHandle<std::io::Result<()>>> {
     // XXX: make this stdout/stderr redirection an optional / opt-in feature?...
+
+    // stderr is /dev/null in a new app process. A pipe means it is forwarded already: by an earlier activity of this process (onCreate runs again for every new one), or by the app itself, e.g. one that started without an activity and captures its own output. Taking it over would cut that off.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(libc::STDERR_FILENO, &mut stat) } == 0 && stat.st_mode & libc::S_IFMT == libc::S_IFIFO {
+        return None;
+    }
 
     let file = unsafe {
         let mut logpipe: [RawFd; 2] = Default::default();
@@ -30,7 +36,7 @@ fn forward_stdio_to_logcat() -> std::thread::JoinHandle<std::io::Result<()>> {
         File::from_raw_fd(logpipe[0])
     };
 
-    std::thread::Builder::new()
+    let forwarder = std::thread::Builder::new()
         .name("stdio-to-logcat".to_string())
         .spawn(move || -> std::io::Result<()> {
             let tag = c"RustStdoutStderr";
@@ -59,7 +65,8 @@ fn forward_stdio_to_logcat() -> std::thread::JoinHandle<std::io::Result<()>> {
                 }
             }
         })
-        .expect("Failed to start stdout/stderr to logcat forwarder thread")
+        .expect("Failed to start stdout/stderr to logcat forwarder thread");
+    Some(forwarder)
 }
 
 unsafe extern "C" fn _android_activity_anchor() {}
